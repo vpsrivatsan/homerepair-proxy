@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HomeRepair AI</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #f5f0e8; color: #1a1410; min-height: 100vh; }
+    textarea, input, button { font-family: inherit; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef } = React;
+
+// ── Your Vercel backend — all API calls go through here ───────────────
+const BACKEND = "";  // empty = same domain (your Vercel URL)
+
+const SEV = {
+  critical: { bg: "#fff0ed", border: "#c0441c", label: "Critical" },
+  major:    { bg: "#fff8e6", border: "#d4820a", label: "Major" },
+  minor:    { bg: "#f0f7f3", border: "#3d6b4f", label: "Minor" },
+};
+
+const SAMPLE = `ROOF SYSTEM:
+- Missing and damaged shingles in the NW quadrant (~15 sq ft).
+- Chimney flashing severely deteriorated, pulling away from masonry — active leak potential.
+- Gutters sagging on east elevation, pulling away from fascia board.
+
+ELECTRICAL SYSTEM:
+- Main panel shows double-tapping on 3 circuit breakers — fire hazard.
+- GFCI protection missing in both bathrooms and kitchen countertop circuits.
+- Exposed romex wiring in garage, unsecured and unprotected.
+- 40-amp breakers appear to have wiring too small for the breaker. Should have at least 8-AWG wire (NEC 310.15). This breaker was for the cooktop.
+
+PLUMBING:
+- Water heater is 18+ years old (2006), well beyond expected lifespan.
+- Active drip at kitchen sink P-trap.
+- Master bath toilet runs intermittently — flapper needs replacement.
+- Water pressure at 95 PSI, above recommended 60-80 PSI range.
+
+HVAC:
+- Furnace is 22 years old with rust on heat exchanger — potential CO risk.
+- AC condenser coils are dirty, service date unknown.
+- Several bedroom supply vents blocked or disconnected from ductwork.
+
+FOUNDATION AND STRUCTURE:
+- Minor step cracking in SE corner of foundation.
+- Soft spot in hallway bathroom subfloor — likely moisture damage beneath tile.
+
+INTERIOR:
+- Water staining on master bedroom ceiling from past roof leak.
+- Guest bedroom window has failed thermal seal — fogged glass.
+- Staircase handrail is loose, does not meet code height requirements.`;
+
+// ── Helpers ────────────────────────────────────────────────────────────
+function parseJSON(raw) {
+  const s = raw.replace(/```json|```/gi, "").trim();
+  try { return JSON.parse(s); } catch (_) {}
+  const ai = s.indexOf("["), aj = s.lastIndexOf("]");
+  if (ai !== -1 && aj > ai) {
+    try { return JSON.parse(s.slice(ai, aj + 1)); } catch (_) {}
+    for (let i = aj; i > ai; i--) {
+      if (s[i] === "]") { try { return JSON.parse(s.slice(ai, i + 1)); } catch (_) {} }
+    }
+  }
+  return null;
+}
+
+function splitSections(text) {
+  const isHeader = t => {
+    if (!t || t.length < 3 || t.length > 70) return false;
+    if (/^[\-\•\*0-9]/.test(t)) return false;
+    if (t.split(" ").length > 8) return false;
+    return /^[A-Z][A-Z\s\/&\(\)\-]{2,}:?\s*$/.test(t) ||
+           /^[A-Z][a-zA-Z\s\/&\(\)\-]+:\s*$/.test(t);
+  };
+  const lines = text.split("\n");
+  const secs = [];
+  let name = null, buf = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (isHeader(t)) {
+      if (name && buf.join("\n").trim().length > 20)
+        secs.push({ name: name.replace(/:$/, "").trim(), text: buf.join("\n").trim() });
+      name = t.replace(/:$/, "").trim(); buf = [];
+    } else buf.push(line);
+  }
+  if (name && buf.join("\n").trim().length > 20)
+    secs.push({ name: name.replace(/:$/, "").trim(), text: buf.join("\n").trim() });
+
+  if (secs.length < 2) {
+    secs.length = 0;
+    const n = Math.min(8, Math.ceil(text.length / 5000));
+    const sz = Math.ceil(text.length / n);
+    for (let i = 0; i < n; i++) {
+      const chunk = text.slice(i * sz, (i + 1) * sz).trim();
+      if (chunk.length > 50) secs.push({ name: `Part ${i + 1} of ${n}`, text: chunk });
+    }
+  }
+  const out = [];
+  for (const sec of secs) {
+    if (sec.text.length <= 6000) { out.push(sec); continue; }
+    let p = 1;
+    for (let i = 0; i < sec.text.length; i += 6000)
+      out.push({ name: `${sec.name} (${p++})`, text: sec.text.slice(i, i + 6000) });
+  }
+  return out;
+}
+
+// ── API calls — all go through Vercel backend ──────────────────────────
+async function callClaude(prompt) {
+  const r = await fetch(`${BACKEND}/api/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt })
+  });
+  if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.error || "HTTP " + r.status); }
+  const d = await r.json();
+  return d.content.map(b => b.text || "").join("");
+}
+
+// Real Google Places via Vercel proxy
+const contractorCache = {};
+async function getContractors(trade, zip) {
+  const k = `${trade}|${zip}`;
+  if (contractorCache[k]) return contractorCache[k];
+  try {
+    // Text search
+    const sr = await fetch(`${BACKEND}/api/places?query=${encodeURIComponent(trade + " near " + zip)}`);
+    if (!sr.ok) return [];
+    const sd = await sr.json();
+    const places = (sd.results || []).slice(0, 2);
+    if (!places.length) return [];
+
+    // Get details (phone number) for each place
+    const results = await Promise.all(places.map(async p => {
+      try {
+        const dr = await fetch(`${BACKEND}/api/places?placeid=${encodeURIComponent(p.place_id)}`);
+        const dd = dr.ok ? ((await dr.json()).result || {}) : {};
+        return {
+          name: dd.name || p.name,
+          phone: dd.formatted_phone_number || "",
+          rating: dd.rating ? String(dd.rating) : (p.rating ? String(p.rating) : ""),
+          address: dd.formatted_address || p.formatted_address || "",
+        };
+      } catch (_) {
+        return { name: p.name, phone: "", rating: p.rating ? String(p.rating) : "", address: p.formatted_address || "" };
+      }
+    }));
+    contractorCache[k] = results;
+    return results;
+  } catch (_) { return []; }
+}
+
+// ── PDF extraction ─────────────────────────────────────────────────────
+async function extractPDFText(file) {
+  const lib = pdfjsLib;
+  lib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  const pdf = await lib.getDocument({ data: await file.arrayBuffer() }).promise;
+  let text = "";
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const pg = await pdf.getPage(i);
+    const tc = await pg.getTextContent();
+    text += tc.items.map(x => x.str).join(" ") + "\n\n";
+  }
+  if (!text.trim()) throw new Error("No selectable text found. Use Paste Text instead.");
+  return text;
+}
+
+// ── Components ─────────────────────────────────────────────────────────
+function RepairCard({ r, zip }) {
+  const [open, setOpen] = React.useState(false);
+  const sv = SEV[r.severity] || SEV.minor;
+  return (
+    <div style={{ borderRadius: 10, border: `1px solid ${sv.border}`, background: sv.bg, marginBottom: 8, overflow: "hidden" }}>
+      <div onClick={() => setOpen(o => !o)}
+        style={{ padding: "11px 14px", display: "flex", alignItems: "flex-start", gap: 10, cursor: "pointer" }}>
+        <span style={{ padding: "2px 8px", borderRadius: 100, fontSize: 10, fontWeight: 700, textTransform: "uppercase", color: sv.border, border: `1px solid ${sv.border}`, background: "white", flexShrink: 0, marginTop: 1 }}>{sv.label}</span>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 600, fontSize: 13 }}>{r.title}</div>
+          <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>{[r.contractorType, r.urgency, r.location].filter(Boolean).join(" · ")}</div>
+        </div>
+        <div style={{ textAlign: "right", flexShrink: 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>${(r.estimatedCostMin||0).toLocaleString()}–${(r.estimatedCostMax||0).toLocaleString()}</div>
+          <div style={{ fontSize: 10, color: "#aaa" }}>est.</div>
+        </div>
+        <span style={{ fontSize: 12, color: "#aaa", transform: open ? "rotate(180deg)" : "none", transition: "transform .2s", marginTop: 2 }}>▾</span>
+      </div>
+      {open && (
+        <div style={{ padding: "10px 14px 14px", borderTop: "1px solid rgba(0,0,0,0.07)" }}>
+          <p style={{ fontSize: 13, color: "#555", lineHeight: 1.7, margin: "0 0 12px" }}>{r.description}</p>
+          {r.contractors?.length > 0 ? (
+            <>
+              <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: ".7px", textTransform: "uppercase", color: "#aaa", marginBottom: 8 }}>
+                {r.contractorType} near {zip} · <span style={{ color: "#3d6b4f" }}>via Google Places</span>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {r.contractors.map((c, i) => (
+                  <div key={i} style={{ background: "white", borderRadius: 8, padding: "9px 11px", border: "1px solid rgba(0,0,0,0.09)" }}>
+                    <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 3 }}>{c.name}</div>
+                    {c.phone && <div style={{ color: "#c0441c", fontSize: 11, fontFamily: "monospace" }}>📞 {c.phone}</div>}
+                    {c.rating && <div style={{ color: "#d4820a", fontSize: 11, marginTop: 2 }}>⭐ {c.rating}/5.0</div>}
+                    {c.address && <div style={{ fontSize: 10, color: "#aaa", marginTop: 2 }}>{c.address}</div>}
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <div style={{ fontSize: 12, color: "#aaa", fontStyle: "italic" }}>No contractors found near {zip}.</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SectionCard({ sr, zip }) {
+  const lo = sr.repairs.reduce((s, r) => s + (r.estimatedCostMin || 0), 0);
+  const hi = sr.repairs.reduce((s, r) => s + (r.estimatedCostMax || 0), 0);
+  const cr = sr.repairs.filter(r => r.severity === "critical").length;
+  const mj = sr.repairs.filter(r => r.severity === "major").length;
+  const mn = sr.repairs.filter(r => r.severity === "minor").length;
+  return (
+    <div style={{ background: "white", borderRadius: 14, border: "1px solid #e0d8cc", marginBottom: 16, overflow: "hidden", boxShadow: "0 2px 8px rgba(0,0,0,0.05)" }}>
+      <div style={{ padding: "13px 18px", borderBottom: "1px solid #e0d8cc", background: "#faf8f4", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 700 }}>{sr.name}</div>
+          <div style={{ fontSize: 11, color: "#888", marginTop: 1 }}>{sr.repairs.length} defect{sr.repairs.length !== 1 ? "s" : ""} · ${lo.toLocaleString()}–${hi.toLocaleString()}</div>
+        </div>
+        <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+          {cr > 0 && <span style={{ padding: "2px 9px", borderRadius: 100, fontSize: 10, fontWeight: 700, background: "#fff0ed", color: "#c0441c", border: "1px solid #c0441c" }}>{cr} critical</span>}
+          {mj > 0 && <span style={{ padding: "2px 9px", borderRadius: 100, fontSize: 10, fontWeight: 700, background: "#fff8e6", color: "#d4820a", border: "1px solid #d4820a" }}>{mj} major</span>}
+          {mn > 0 && <span style={{ padding: "2px 9px", borderRadius: 100, fontSize: 10, fontWeight: 700, background: "#f0f7f3", color: "#3d6b4f", border: "1px solid #3d6b4f" }}>{mn} minor</span>}
+        </div>
+      </div>
+      <div style={{ padding: 14 }}>
+        {sr.repairs.length === 0
+          ? <div style={{ fontSize: 13, color: "#aaa" }}>No defects found in this section.</div>
+          : sr.repairs.map((r, ri) => <RepairCard key={ri} r={r} zip={zip} />)}
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ───────────────────────────────────────────────────────────
+function App() {
+  const [tab, setTab] = useState("pdf");
+  const [pasteText, setPasteText] = useState("");
+  const [pdfText, setPdfText] = useState("");
+  const [fileName, setFileName] = useState("");
+  const [extracting, setExtracting] = useState(false);
+  const [zip, setZip] = useState("");
+  const [dragging, setDragging] = useState(false);
+  const fileRef = useRef(null);
+
+  const [phase, setPhase] = useState("idle");
+  const [loadingMsg, setLoadingMsg] = useState("");
+  const [sections, setSections] = useState([]);
+  const [sectionIdx, setSectionIdx] = useState(0);
+  const [results, setResults] = useState([]);
+  const [error, setError] = useState("");
+
+  const reportText = () => (tab === "paste" ? pasteText : pdfText).trim();
+
+  async function handleFile(file) {
+    if (!file || !file.name.endsWith(".pdf")) { setError("Please select a PDF file."); return; }
+    setFileName(file.name); setExtracting(true); setError(""); setPdfText("");
+    try {
+      const text = await extractPDFText(file);
+      setPdfText(text);
+    } catch (e) { setError("PDF error: " + e.message); setFileName(""); }
+    finally { setExtracting(false); }
+  }
+
+  async function analyzeSection(sec, zipCode) {
+    setLoadingMsg(`Analyzing "${sec.name}"...`);
+    const raw = await callClaude(
+      `Home inspection analyst and cost estimator. ZIP: ${zipCode}.\nExtract ALL defects from text below. Each bullet or sentence = one entry. Do NOT group or skip any.\nReturn ONLY a JSON array, no prose:\n[{"title":"short title","severity":"critical","location":"area","description":"exact issue","contractorType":"Electrician","estimatedCostMin":500,"estimatedCostMax":1200,"urgency":"Immediate"}]\nseverity: critical|major|minor\nurgency: Immediate|Within 3 months|Within 1 year\ncontractorType: Electrician|Roofer|Plumber|HVAC Technician|Foundation Specialist|General Contractor\nUse 2025 pricing for ZIP ${zipCode}. Return [] if no defects.\n\nText:\n${sec.text}`
+    );
+    const parsed = parseJSON(raw);
+    const repairs = Array.isArray(parsed) ? parsed.map((r, i) => ({ id: i + 1, ...r })) : [];
+    if (repairs.length === 0) return [];
+
+    setLoadingMsg(`Finding contractors for "${sec.name}"...`);
+    const trades = [...new Set(repairs.map(r => r.contractorType).filter(Boolean))];
+    const cm = {};
+    for (const t of trades) cm[t] = await getContractors(t, zipCode);
+    return repairs.map(r => ({ ...r, contractors: cm[r.contractorType] || [] }));
+  }
+
+  async function runSection(allSecs, idx, prev) {
+    setPhase("analyzing"); setError("");
+    try {
+      const repairs = await analyzeSection(allSecs[idx], zip);
+      const next = [...prev, { name: allSecs[idx].name, repairs }];
+      setResults(next); setSectionIdx(idx); setPhase("awaiting");
+    } catch (e) {
+      setError(`Error on "${allSecs[idx]?.name}": ${e.message}`);
+      setPhase(prev.length > 0 ? "awaiting" : "idle");
+    }
+  }
+
+  async function startAnalysis() {
+    setError("");
+    const text = reportText();
+    if (!zip.trim()) { setError("Please enter a ZIP code."); return; }
+    if (!text) { setError("Please provide a report."); return; }
+    const secs = splitSections(text);
+    setSections(secs); setResults([]); setSectionIdx(0);
+    await runSection(secs, 0, []);
+  }
+
+  function handleContinue() {
+    const next = sectionIdx + 1;
+    if (next >= sections.length) setPhase("done");
+    else runSection(sections, next, results);
+  }
+
+  function handleReset() {
+    setPhase("idle"); setSections([]); setResults([]);
+    setSectionIdx(0); setError(""); setFileName("");
+    setPdfText(""); setPasteText(""); setTab("pdf");
+  }
+
+  const allRepairs = results.flatMap(s => s.repairs);
+  const crC = allRepairs.filter(r => r.severity === "critical").length;
+  const mjC = allRepairs.filter(r => r.severity === "major").length;
+  const mnC = allRepairs.filter(r => r.severity === "minor").length;
+  const totLo = allRepairs.reduce((s, r) => s + (r.estimatedCostMin || 0), 0);
+  const totHi = allRepairs.reduce((s, r) => s + (r.estimatedCostMax || 0), 0);
+
+  return (
+    <div style={{ fontFamily: "system-ui,sans-serif", background: "#f5f0e8", minHeight: "100vh" }}>
+      {/* Header */}
+      <div style={{ background: "#1a1410", color: "#f5f0e8", padding: "0 24px", height: 56, display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 100 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ width: 28, height: 28, background: "#c0441c", borderRadius: 7, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14 }}>🏠</div>
+          <span style={{ fontSize: 16, fontWeight: 600 }}>HomeRepair <span style={{ color: "#f0a827" }}>AI</span></span>
+        </div>
+        <span style={{ fontSize: 10, color: "rgba(245,240,232,0.4)", letterSpacing: "1px" }}>INSPECT · ANALYZE · ACT</span>
+      </div>
+
+      <div style={{ maxWidth: 780, margin: "0 auto", padding: "22px 16px 60px" }}>
+
+        {/* ── IDLE ── */}
+        {phase === "idle" && <>
+          {/* Report card */}
+          <div style={{ background: "white", borderRadius: 14, border: "1px solid #e0d8cc", marginBottom: 16, overflow: "hidden", boxShadow: "0 2px 10px rgba(0,0,0,0.06)" }}>
+            <div style={{ padding: "15px 20px 12px", borderBottom: "1px solid #e0d8cc", display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ width: 32, height: 32, background: "#fff0ed", borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center" }}>📄</div>
+              <div><div style={{ fontSize: 14, fontWeight: 600 }}>Inspection Report</div><div style={{ fontSize: 12, color: "#888" }}>Upload PDF or paste text</div></div>
+            </div>
+            <div style={{ padding: 20 }}>
+              <div style={{ display: "flex", borderBottom: "1px solid #e0d8cc", marginBottom: 16 }}>
+                {[["pdf","📎 Upload PDF"],["paste","📝 Paste text"],["sample","Load sample"]].map(([id,lbl]) => (
+                  <button key={id} onClick={() => { if (id === "sample") { setTab("paste"); setPasteText(SAMPLE); } else setTab(id); }}
+                    style={{ padding: "7px 16px", background: "none", border: "none", borderBottom: tab === id ? "2px solid #1a1410" : "2px solid transparent", cursor: "pointer", fontSize: 13, fontWeight: tab === id ? 600 : 400, color: tab === id ? "#1a1410" : "#888", marginBottom: -1 }}>{lbl}</button>
+                ))}
+              </div>
+
+              {tab === "pdf" && <>
+                <div
+                  onDragOver={e => { e.preventDefault(); setDragging(true); }}
+                  onDragLeave={() => setDragging(false)}
+                  onDrop={e => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]); }}
+                  onClick={() => fileRef.current?.click()}
+                  style={{ border: `2px dashed ${dragging ? "#c0441c" : "#ccc"}`, borderRadius: 10, padding: "30px 20px", textAlign: "center", cursor: "pointer", background: dragging ? "#fff5f2" : "#fafaf8", transition: "all .15s" }}>
+                  <input ref={fileRef} type="file" accept=".pdf" style={{ display: "none" }} onChange={e => handleFile(e.target.files[0])} />
+                  <div style={{ fontSize: 30, marginBottom: 8 }}>📋</div>
+                  <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>{fileName || "Drop PDF here or click to browse"}</div>
+                  <div style={{ fontSize: 12, color: "#888" }}>PDF files only</div>
+                </div>
+                {extracting && <div style={{ marginTop: 10, fontSize: 13, color: "#888" }}>⏳ Extracting text...</div>}
+                {pdfText && !extracting && <>
+                  <div style={{ marginTop: 10, fontSize: 13, color: "#3d6b4f", background: "#f0f7f3", padding: "8px 12px", borderRadius: 8, border: "1px solid #3d6b4f" }}>
+                    ✓ {fileName} — {pdfText.length.toLocaleString()} chars extracted
+                  </div>
+                  <div style={{ marginTop: 10 }}>
+                    <label style={{ display: "block", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".7px", color: "#555", marginBottom: 5 }}>Extracted text (editable)</label>
+                    <textarea value={pdfText} onChange={e => setPdfText(e.target.value)}
+                      style={{ width: "100%", height: 120, padding: "9px 11px", border: "1px solid #ddd", borderRadius: 8, fontFamily: "monospace", fontSize: 12, lineHeight: 1.6, resize: "vertical", outline: "none", background: "#fafafa", boxSizing: "border-box" }} />
+                  </div>
+                </>}
+              </>}
+
+              {tab === "paste" && <>
+                <label style={{ display: "block", fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".7px", color: "#555", marginBottom: 5 }}>Report text</label>
+                <textarea value={pasteText} onChange={e => setPasteText(e.target.value)}
+                  placeholder="Paste full inspection report here..."
+                  style={{ width: "100%", height: 180, padding: "9px 11px", border: "1px solid #ddd", borderRadius: 8, fontFamily: "monospace", fontSize: 12, lineHeight: 1.6, resize: "vertical", outline: "none", background: "#fafafa", boxSizing: "border-box" }} />
+              </>}
+            </div>
+          </div>
+
+          {/* ZIP card */}
+          <div style={{ background: "white", borderRadius: 14, border: "1px solid #e0d8cc", marginBottom: 16, overflow: "hidden", boxShadow: "0 2px 10px rgba(0,0,0,0.06)" }}>
+            <div style={{ padding: "15px 20px 12px", borderBottom: "1px solid #e0d8cc", display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ width: 32, height: 32, background: "#fff8e6", borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center" }}>📍</div>
+              <div><div style={{ fontSize: 14, fontWeight: 600 }}>Property ZIP Code</div><div style={{ fontSize: 12, color: "#888" }}>For local pricing and contractor search</div></div>
+            </div>
+            <div style={{ padding: 20 }}>
+              <input value={zip} onChange={e => setZip(e.target.value)} placeholder="e.g. 75028"
+                style={{ width: "100%", padding: "10px 13px", border: "1px solid #ddd", borderRadius: 8, fontSize: 14, outline: "none", background: "#fafafa", boxSizing: "border-box", marginBottom: 12 }} />
+              <div style={{ fontSize: 12, color: "#3d6b4f", background: "#f0f7f3", padding: "8px 12px", borderRadius: 8, border: "1px solid #3d6b4f", marginBottom: 14 }}>
+                🏢 Real contractor data from Google Places
+              </div>
+              {error && <div style={{ background: "#fff0ed", border: "1px solid #c0441c", borderRadius: 8, padding: "9px 13px", color: "#c0441c", fontSize: 13, marginBottom: 14 }}>{error}</div>}
+              <button onClick={startAnalysis}
+                style={{ padding: "11px 28px", background: "#c0441c", color: "white", border: "none", borderRadius: 10, fontSize: 14, fontWeight: 600, cursor: "pointer", boxShadow: "0 4px 12px rgba(192,68,28,0.3)" }}>
+                Start Analysis →
+              </button>
+            </div>
+          </div>
+        </>}
+
+        {/* ── ANALYZING ── */}
+        {phase === "analyzing" && (
+          <div style={{ background: "white", borderRadius: 14, border: "1px solid #e0d8cc", padding: 36, textAlign: "center", boxShadow: "0 2px 10px rgba(0,0,0,0.06)" }}>
+            <div style={{ fontSize: 36, marginBottom: 16 }}>🔍</div>
+            <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 6 }}>{loadingMsg}</div>
+            <div style={{ fontSize: 13, color: "#888", marginBottom: 20 }}>Section {sectionIdx + 1} of {sections.length}</div>
+            <div style={{ height: 6, background: "#e0d8cc", borderRadius: 100, overflow: "hidden", marginBottom: 24 }}>
+              <div style={{ height: "100%", background: "linear-gradient(90deg,#c0441c,#d4820a)", borderRadius: 100, transition: "width .4s", width: `${Math.round(sectionIdx / Math.max(sections.length,1) * 100)}%` }} />
+            </div>
+            <button onClick={() => setPhase("idle")}
+              style={{ padding: "8px 20px", background: "none", border: "1px solid #ddd", borderRadius: 8, fontSize: 13, color: "#888", cursor: "pointer" }}>✕ Cancel</button>
+          </div>
+        )}
+
+        {/* ── RESULTS ── */}
+        {(phase === "awaiting" || phase === "done") && <>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 16 }}>
+            {[
+              { l: "Critical", v: crC, c: "#c0441c" },
+              { l: "Major", v: mjC, c: "#d4820a" },
+              { l: "Minor", v: mnC, c: "#3d6b4f" },
+              { l: "Est. Total", v: `$${totLo.toLocaleString()}–$${totHi.toLocaleString()}`, c: "#1a1410", sm: true },
+            ].map(s => (
+              <div key={s.l} style={{ background: "white", borderRadius: 12, padding: "12px 14px", border: "1px solid #e0d8cc" }}>
+                <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: ".7px", color: "#888", fontWeight: 600, marginBottom: 4 }}>{s.l}</div>
+                <div style={{ fontSize: s.sm ? 11 : 22, fontWeight: 600, color: s.c, lineHeight: 1.2 }}>{s.v}</div>
+              </div>
+            ))}
+          </div>
+
+          {results.map((sr, i) => <SectionCard key={i} sr={sr} zip={zip} />)}
+
+          {error && <div style={{ background: "#fff0ed", border: "1px solid #c0441c", borderRadius: 8, padding: "9px 13px", color: "#c0441c", fontSize: 13, marginBottom: 14 }}>{error}</div>}
+
+          <div style={{ background: "#1a1410", borderRadius: 14, padding: "18px 22px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" }}>
+            {phase === "awaiting" && sectionIdx + 1 < sections.length ? <>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 600, color: "#f5f0e8", marginBottom: 3 }}>Next: "{sections[sectionIdx + 1].name}"</div>
+                <div style={{ fontSize: 12, color: "rgba(245,240,232,0.5)" }}>Completed {sectionIdx + 1} of {sections.length} · {allRepairs.length} defects so far</div>
+              </div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button onClick={handleContinue} style={{ padding: "9px 22px", background: "#c0441c", color: "white", border: "none", borderRadius: 10, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>Yes, continue →</button>
+                <button onClick={() => setPhase("done")} style={{ padding: "9px 16px", background: "rgba(255,255,255,0.08)", color: "white", border: "1px solid rgba(255,255,255,0.2)", borderRadius: 10, fontSize: 13, cursor: "pointer" }}>Stop here</button>
+              </div>
+            </> : <>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 600, color: "#f5f0e8", marginBottom: 3 }}>Analysis complete</div>
+                <div style={{ fontSize: 12, color: "rgba(245,240,232,0.5)" }}>{allRepairs.length} defects · {results.length} sections · ${totLo.toLocaleString()}–${totHi.toLocaleString()} est.</div>
+              </div>
+              <button onClick={handleReset} style={{ padding: "9px 20px", background: "rgba(255,255,255,0.08)", color: "white", border: "1px solid rgba(255,255,255,0.15)", borderRadius: 10, fontSize: 13, cursor: "pointer" }}>↩ Start over</button>
+            </>}
+          </div>
+        </>}
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
